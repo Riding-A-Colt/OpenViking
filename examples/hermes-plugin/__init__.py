@@ -1951,6 +1951,84 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 warning_callback=self._runtime_warning_callback,
             )
 
+    def _ensure_client_for_tool(self) -> Optional["_VikingClient"]:
+        """Resolve the client at the tool boundary, starting a local server if needed.
+
+        Upstream resolves from ``_ensure_client()`` here. That returns None without
+        probing — and therefore without auto-starting — whenever the refresh
+        baseline is not established, so a session whose first OpenViking call comes
+        before (or without) initialize() just reports "server not connected" and
+        stays broken. The tool call is exactly when the server's cost is worth
+        paying, so start it here, wait for the listener, then attach.
+        """
+        client = self._ensure_client()
+        if client is not None:
+            return client
+        endpoint = self._endpoint
+        if not endpoint:
+            # A tool can be the first provider surface to run; resolve the
+            # connection the way initialize() would.
+            try:
+                config, env = self._profile_config_and_env()
+                settings = self._resolve_bound_connection_settings(config, env)
+            except Exception:
+                logger.debug("OpenViking tool-time endpoint resolution failed", exc_info=True)
+                return None
+            self._endpoint, self._api_key, self._account, self._user, self._agent = (
+                settings[k] for k in _CONNECTION_KEYS
+            )
+            endpoint = self._endpoint
+        if not endpoint or not _is_local_openviking_url(endpoint) or self._shutting_down:
+            return None
+        with self._runtime_start_lock:
+            already_starting = bool(
+                self._runtime_start_pending
+                or (self._runtime_start_thread and self._runtime_start_thread.is_alive())
+            )
+            if not already_starting:
+                self._runtime_start_pending = True
+                try:
+                    state, message = _start_local_openviking_server(
+                        endpoint, hermes_home=self._hermes_home
+                    )
+                except Exception:
+                    logger.debug("OpenViking tool-time startup failed", exc_info=True)
+                    state, message = _LOCAL_SERVER_FAILED, "startup raised"
+                finally:
+                    self._runtime_start_pending = False
+                if state == _LOCAL_SERVER_FAILED:
+                    _emit_runtime(
+                        f"Local OpenViking server at {endpoint} could not be started: {message}",
+                        self._runtime_warning_callback,
+                    )
+                    return None
+        # Either we just spawned it or upstream's runtime-start waiter owns the
+        # spawn; in both cases wait for the listener instead of failing the
+        # session's first tool call.
+        if not _wait_for_openviking_health(
+            endpoint,
+            timeout_seconds=_LOCAL_OPENVIKING_AUTOSTART_TIMEOUT,
+            should_stop=lambda: self._shutting_down,
+        ):
+            _emit_runtime(
+                _runtime_openviking_timeout_message(endpoint),
+                self._runtime_warning_callback,
+            )
+            return None
+        # Build directly instead of going back through _ensure_client_locked():
+        # that path can short-circuit on an in-flight runtime-start thread or on
+        # the cooldown the failed probe just armed.
+        try:
+            client = self._build_client()
+            health_state, _health_message = _classify_runtime_openviking_health(client, endpoint)
+        except ImportError:
+            logger.warning(_HTTPX_MISSING)
+            return None
+        if health_state != "healthy":
+            return None
+        self._publish_client(client, endpoint)
+        return self._client
+
     def _profile_config_and_env(self) -> tuple[dict, Optional[dict]]:
         home = self._hermes_home if self._hermes_home_bound else None
         env = _profile_openviking_env(home)
@@ -3269,7 +3347,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return list(_TOOL_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        if not self._ensure_client():
+        if not self._ensure_client_for_tool():
             return tool_error("OpenViking server not connected")
         handler = _TOOL_HANDLERS.get(tool_name)
         if handler is None:
@@ -3412,7 +3490,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         content = args.get("content", "")
         if not content:
             return tool_error("content is required")
-        client = self._ensure_client()
+        client = self._ensure_client_for_tool()
         if not client:
             return tool_error("OpenViking server not connected")
 
