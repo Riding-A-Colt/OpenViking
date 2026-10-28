@@ -32,6 +32,41 @@ Cost: the first tool call of a cold session blocks instead of failing (~5–15 s
 with a warm model cache, longer on first model load). No behaviour change when a
 server is already up.
 
+## Patch 2: let the conversation hooks start it too
+
+**Symptom.** Turns of a session that never called a `viking_*` tool were never
+recorded. `sync_turn()` starts with `if not self._ensure_client(): return`, and
+`_ensure_client()` returns `None` without spawning, so every turn was dropped —
+no session on the server, no pending marker, nothing to recover later. `prefetch()`
+and `system_prompt_block()` had the same guard, so such a session also had no
+recall.
+
+**Patch.** `_ensure_client_for_tool()` gained two arguments:
+
+- `probe=True` — a cached client is health-checked before it is handed out. An
+  idle shutdown or crash otherwise leaves `self._client` pointing at a dead
+  endpoint, and every write then fails silently. On failure the client is dropped
+  (`_drop_stale_client()`, which also clears `_conn_snapshot` / `_failed_refresh`
+  so `_ensure_client_locked()` rebuilds instead of short-circuiting).
+- `wait_seconds` — hooks use `_LOCAL_OPENVIKING_HOOK_START_TIMEOUT` (25 s) instead
+  of the tool path's 60 s, so a cold start cannot stall a turn for a full minute.
+
+`system_prompt_block()`, `prefetch()`, and `sync_turn()` now call it with
+`probe=True`. Tool calls still call it bare: an explicit `viking_*` request must
+always try, even inside a cooldown.
+
+**Cooldown.** A failed start arms `_hook_start_cooldown_until` for
+`_LOCAL_OPENVIKING_HOOK_START_COOLDOWN` (120 s); hooks skip while it is armed
+instead of adding the wait to every turn. Tool calls ignore it.
+
+**Consequence for idle shutdown.** With these hooks a session brings the server up
+on its own, so it is safe to stop the server when nobody is using it: the next
+message restarts it. Pair it with an external idle guard — the plugin itself never
+stops a server it started (`Popen(..., start_new_session=True)`), by design.
+
+Verified with `tests/verify_hook_autostart.py` (standalone; runs against any
+Hermes install, no pytest and no live server required).
+
 ## Local prerequisites this patch assumes
 
 - `openviking-server` on `PATH`. On macOS a wrapper in `~/.local/bin` is needed

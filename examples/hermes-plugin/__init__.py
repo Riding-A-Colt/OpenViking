@@ -182,6 +182,12 @@ _NON_PRIMARY_AGENT_CONTEXTS = frozenset({"cron", "subagent", "flush"})
 _GENERATED_MEMORY_SUMMARY_FILENAMES = {".abstract.md", ".overview.md"}
 _LOCAL_OPENVIKING_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _LOCAL_OPENVIKING_AUTOSTART_TIMEOUT = 60.0
+# Conversation hooks (system prompt / prefetch / sync_turn) start the server too, so
+# a session that never calls a viking_* tool still records its turns. They get a
+# shorter budget than a tool call: a cold start must not stall a turn for a minute.
+_LOCAL_OPENVIKING_HOOK_START_TIMEOUT = 25.0
+# After a failed start, skip the next attempts instead of making every turn wait.
+_LOCAL_OPENVIKING_HOOK_START_COOLDOWN = 120.0
 _LOCAL_OPENVIKING_PROBE_TIMEOUT = 2.0  # loopback connect budget; only guards against a wedged listener
 _LOCAL_SERVER_STARTED = "started"
 _LOCAL_SERVER_OCCUPIED = "occupied"
@@ -1629,6 +1635,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._failed_refresh: Optional[tuple] = None
         self._runtime_start_thread: Optional[threading.Thread] = None
         self._runtime_start_pending = False
+        self._hook_start_cooldown_until = 0.0
         self._runtime_status_callback = None
         self._runtime_warning_callback = None
         self._shutting_down = False  # finalizers stop issuing network writes
@@ -1734,6 +1741,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
         with self._session_state_lock:
             self._client = client
             self._conn_snapshot = self._settings_tuple(endpoint)
+            self._failed_refresh = None
+
+    def _drop_stale_client(self) -> None:
+        """Forget a client whose server stopped answering (idle shutdown, crash).
+
+        Clearing ``_conn_snapshot``/``_failed_refresh`` lets the next
+        ``_ensure_client_locked()`` rebuild and probe instead of short-circuiting on
+        the cached identity or on a cooldown armed by an unrelated failure.
+        """
+        with self._session_state_lock:
+            self._client = None
+            self._conn_snapshot = None
             self._failed_refresh = None
 
     def _capture_commit_scope(self) -> _CommitScope:
@@ -1951,7 +1970,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 warning_callback=self._runtime_warning_callback,
             )
 
-    def _ensure_client_for_tool(self) -> Optional["_VikingClient"]:
+    def _ensure_client_for_tool(self, *, wait_seconds: Optional[float] = None,
+                                probe: bool = False) -> Optional["_VikingClient"]:
         """Resolve the client at the tool boundary, starting a local server if needed.
 
         Upstream resolves from ``_ensure_client()`` here. That returns None without
@@ -1960,10 +1980,37 @@ class OpenVikingMemoryProvider(MemoryProvider):
         before (or without) initialize() just reports "server not connected" and
         stays broken. The tool call is exactly when the server's cost is worth
         paying, so start it here, wait for the listener, then attach.
+
+        ``probe=True`` additionally verifies a cached client before handing it out:
+        an idle shutdown or a crash leaves ``self._client`` pointing at a dead
+        endpoint, and silently failing every write is worse than reconnecting.
+        Conversation hooks (system prompt / prefetch / sync_turn) pass it, so the
+        server also comes up for sessions that never call a ``viking_*`` tool.
         """
         client = self._ensure_client()
         if client is not None:
-            return client
+            if not probe:
+                return client
+            endpoint_probe = self._endpoint or _DEFAULT_ENDPOINT
+            try:
+                health_state, _health_message = _classify_runtime_openviking_health(
+                    client, endpoint_probe
+                )
+            except Exception:
+                health_state = "unreachable"
+            if health_state == "healthy":
+                return client
+            logger.info(
+                "OpenViking at %s stopped answering (%s); dropping the cached client",
+                endpoint_probe, health_state,
+            )
+            self._drop_stale_client()
+            # A hook ran into a dead server: let the start path below run now, and
+            # arm the cooldown only if starting fails.
+            self._hook_start_cooldown_until = 0.0
+        elif probe and self._hook_start_cooldown_until and time.monotonic() < self._hook_start_cooldown_until:
+            # Starting failed recently; don't make every turn wait for it again.
+            return None
         endpoint = self._endpoint
         if not endpoint:
             # A tool can be the first provider surface to run; resolve the
@@ -1997,6 +2044,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 finally:
                     self._runtime_start_pending = False
                 if state == _LOCAL_SERVER_FAILED:
+                    self._hook_start_cooldown_until = time.monotonic() + _LOCAL_OPENVIKING_HOOK_START_COOLDOWN
                     _emit_runtime(
                         f"Local OpenViking server at {endpoint} could not be started: {message}",
                         self._runtime_warning_callback,
@@ -2007,9 +2055,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # session's first tool call.
         if not _wait_for_openviking_health(
             endpoint,
-            timeout_seconds=_LOCAL_OPENVIKING_AUTOSTART_TIMEOUT,
+            timeout_seconds=wait_seconds or _LOCAL_OPENVIKING_AUTOSTART_TIMEOUT,
             should_stop=lambda: self._shutting_down,
         ):
+            self._hook_start_cooldown_until = time.monotonic() + _LOCAL_OPENVIKING_HOOK_START_COOLDOWN
             _emit_runtime(
                 _runtime_openviking_timeout_message(endpoint),
                 self._runtime_warning_callback,
@@ -2025,8 +2074,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.warning(_HTTPX_MISSING)
             return None
         if health_state != "healthy":
+            self._hook_start_cooldown_until = time.monotonic() + _LOCAL_OPENVIKING_HOOK_START_COOLDOWN
             return None
         self._publish_client(client, endpoint)
+        self._hook_start_cooldown_until = 0.0
         return self._client
 
     def _profile_config_and_env(self) -> tuple[dict, Optional[dict]]:
@@ -2152,7 +2203,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return self._user_id if current is None else current
 
     def system_prompt_block(self) -> str:
-        if not self._ensure_client():
+        if not self._ensure_client_for_tool(
+            wait_seconds=_LOCAL_OPENVIKING_HOOK_START_TIMEOUT, probe=True
+        ):
             return ""
         header = f"# OpenViking Knowledge Base\nActive. Endpoint: {self._endpoint}\n"
         try:
@@ -2184,7 +2237,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Session-start memory block (once per session) + query recall."""
         query_text = _derive_openviking_user_text(query).strip()
-        if not self._ensure_client():
+        if not self._ensure_client_for_tool(
+            wait_seconds=_LOCAL_OPENVIKING_HOOK_START_TIMEOUT, probe=True
+        ):
             return ""
         effective_session_id = str(session_id or self._session_id or "").strip()
         parts = [self._session_start_memory_context(effective_session_id)]
@@ -2777,7 +2832,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         """Record the conversation turn in OpenViking's session (non-blocking)."""
         if not self._writes_enabled:
             return
-        if not self._ensure_client():
+        if not self._ensure_client_for_tool(
+            wait_seconds=_LOCAL_OPENVIKING_HOOK_START_TIMEOUT, probe=True
+        ):
             return
         user_content = _derive_openviking_user_text(user_content)
         if not user_content:
