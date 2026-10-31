@@ -69,6 +69,12 @@ _LOCAL_FTS_DEFAULT_DB = "~/workflow/ov-hybrid/index/memories.db"
 _LOCAL_FTS_SHORT_DOC_CHARS = 800  # 短于此长度的文档片段即整篇，无需替换 dense 内容
 _RRF_K = 60.0
 _RRF_DENSE_WEIGHT = 0.6
+_RRF_FTS_WEIGHT = 0.4
+# 字面查询识别：ASCII 标识符/路径（≥5 字符）或整句就几个汉字
+_LEXICAL_ASCII_RE = re.compile(r"[A-Za-z0-9_./\\:+@-]{3,}")
+_CJK_TERM_RE = re.compile(r"[\u4e00-\u9fff]{2,6}")
+_LOCAL_FTS_EXACT_ASCII_MIN = 5
+_LOCAL_FTS_EXACT_CJK_MAX = 6
 
 
 def _load_local_fts_class():
@@ -2778,13 +2784,38 @@ class OpenVikingMemoryProvider(MemoryProvider):
             _LOCAL_FTS_ENGINES[key] = engine
             return engine
 
+    @classmethod
+    def _fts_exact_match(cls, query: str, hit: Dict[str, Any]) -> bool:
+        """这一条本地命中是否算「字面命中」。
+
+        两个判据，任一成立即算：
+        1. 查询里有 ≥5 字符的 ASCII 标识符/路径段，且它原样出现在该条的路径/标题/片段里；
+        2. 查询是短中文（汉字合计 ≤6 字），且每个 2–6 字滑动词条都出现在该条里。
+
+        这样纯语义的长问句（「语音播报为什么只播一次」）不会被本地通道劫持，
+        而 `deepseek_v41_flash`、`config.yaml`、`临时音频文件` 这类能直接上位。
+        """
+        hay = f"{hit.get('path', '')}\n{hit.get('title', '')}\n{hit.get('snippet', '')}".lower()
+        if not hay.strip():
+            return False
+        ascii_terms = [t for t in _LEXICAL_ASCII_RE.findall(query or "") if len(t) >= _LOCAL_FTS_EXACT_ASCII_MIN]
+        if any(term.lower() in hay for term in ascii_terms):
+            return True
+        cjk_terms = _CJK_TERM_RE.findall(query or "")
+        if cjk_terms and sum(len(term) for term in cjk_terms) <= _LOCAL_FTS_EXACT_CJK_MAX:
+            return all(term in hay for term in cjk_terms)
+        return False
+
     def _fuse_local_fts(self, query: str, dense_ranked: List[Dict[str, Any]], *, limit: int,
                         settings: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """RRF 加权融合：0.6/(60+rank_dense) + w/(60+rank_fts)。
+        """本地字面命中优先，其余按 dense 名次补齐。
 
-        只按名次融合，不比较两侧分数——dense 的分数区间只有 ±0.01，FTS 的 bm25()
-        是另一套量纲，两者放到同一个刻度上比没有意义。FTS 独有条目用「标题 + 片段」
-        顶上 abstract，因此不会触发 L2 全读，也不会占满注入预算。任何异常退回纯 dense。
+        只用「字面命中」的本地结果参与重排：dense 的分数区间只有 ±0.01、bm25() 是另一套
+        量纲，两者放同一个刻度上比没有意义，所以本地侧只贡献名次分，并且必须通过
+        `_fts_exact_match` 才能获得 1.0 的基分越到前面。没有字面命中时顺序与纯 dense
+        完全一致（这就是「关开关等价」的另一半保证）。
+
+        FTS 独有条目用「标题 + 片段」顶上 abstract，因此不会触发 L2 全读。
         """
         engine = self._local_fts_engine(settings)
         if engine is None:
@@ -2795,10 +2826,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         except Exception as e:  # noqa: BLE001 - 索引坏了也不能拖垮召回
             logger.debug("ov-hybrid: local FTS search failed: %s", e)
             return dense_ranked
-        if not hits:
+        exact = {h.get("uri"): (rank, h) for rank, h in enumerate(hits, 1)
+                 if h.get("uri") and self._fts_exact_match(query, h)}
+        if not exact:
             return dense_ranked
 
-        weight = float(settings.get("weight") or 0.0)
         fused: Dict[str, Dict[str, Any]] = {}
         for rank, item in enumerate(dense_ranked, 1):
             uri = str(item.get("uri") or "").strip()
@@ -2807,19 +2839,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
             entry = dict(item)
             entry["_rrf"] = _RRF_DENSE_WEIGHT / (_RRF_K + rank)
             fused[uri] = entry
-        for rank, hit in enumerate(hits, 1):
-            uri = str(hit.get("uri") or "").strip()
-            if not uri:
-                continue
-            contribution = weight / (_RRF_K + rank)
+        for uri, (rank, hit) in exact.items():
             entry = fused.get(uri)
             if entry is None:
                 entry = {"uri": uri, "score": 0.0, "level": 0, "category": "memory",
                          "_rrf": 0.0, "_local_fts_only": True}
                 fused[uri] = entry
-            entry["_rrf"] = float(entry.get("_rrf") or 0.0) + contribution
-            # 长文档（或只在 FTS 侧命中的条目）用片段替换正文：snippet 已按预算生成，
-            # 这里不再二次截断，否则会把命中点截掉。
+            # 1.0 基分 = 字面命中，排在所有纯 dense 条目之前；本地侧名次分权重可配
+            fts_weight = float(settings.get("weight") or _RRF_FTS_WEIGHT)
+            entry["_rrf"] = 1.0 + float(entry.get("_rrf") or 0.0) + fts_weight / (_RRF_K + rank)
             if entry.get("_local_fts_only") or int(hit.get("nchars") or 0) >= _LOCAL_FTS_SHORT_DOC_CHARS:
                 text = "\n".join(
                     part for part in (str(hit.get("title") or "").strip(), str(hit.get("snippet") or "").strip())

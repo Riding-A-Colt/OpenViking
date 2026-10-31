@@ -53,6 +53,9 @@ MIN_CJK_TERM = 2
 #: trigram 索引对 <3 字符的串无效，这些词条只能走 LIKE。
 TRIGRAM_MIN_CHARS = 3
 
+#: 索引结构版本。改动索引内容/表结构时 +1，指纹随之变化，旧库自动重建。
+INDEX_VERSION = 2
+
 _ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9_./\\\-]+")
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
@@ -383,7 +386,7 @@ class LocalFTSEngine:
             if st.st_mtime_ns > max_mtime:
                 max_mtime = st.st_mtime_ns
         items.sort(key=lambda t: t[0])
-        fp = f"n{len(items)}:m{max_mtime}:b{total}"
+        fp = f"v{INDEX_VERSION}:n{len(items)}:m{max_mtime}:b{total}"
         return items, fp
 
     def _uri_for(self, rel: str, abs_path: str) -> str:
@@ -456,11 +459,15 @@ class LocalFTSEngine:
                 seen_rel.add(rel)
                 norm = normalize(body)
                 rid = len(docs_rows) + 1
+                title = _extract_title(body, rel)
                 docs_rows.append(
-                    (rid, rel, self._uri_for(rel, abs_path), _extract_title(body, rel),
+                    (rid, rel, self._uri_for(rel, abs_path), title,
                      mtime_ns / 1e9, len(body), body, norm)
                 )
-                fts_rows.append((rid, rel, norm))
+                # 索引体里带上相对路径和标题：文件名本身就是最常见的字面查询目标
+                # （`deepseek_v41_flash`、`codex_config` 这类只出现在路径里的词，
+                #  只索引正文时永远查不到）。
+                fts_rows.append((rid, rel, f"{rel}\n{title}\n{norm}"))
 
             conn.executemany(
                 "INSERT INTO docs(rowid, path, uri, title, mtime, nchars, body, norm) "
