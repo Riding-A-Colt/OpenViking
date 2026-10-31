@@ -59,6 +59,43 @@ try:
 except ImportError:  # Hermes releases before process-home pinning
     _get_launch_hermes_home = get_process_hermes_home
 
+# -- ov-hybrid:fts-merge 本地全文通道 ----------------------------------------
+# 与 dense 检索并行的 SQLite FTS5/BM25 旁路，按 RRF 加权融合。索引与查询都在
+# local_fts.py 里；这里只负责配置解析、引擎缓存和结果合并。文件缺失或任何异常
+# 都退回纯 dense 行为，不影响召回本身。
+_LOCAL_FTS_ENGINES: Dict[str, Any] = {}
+_LOCAL_FTS_LOCK = threading.Lock()
+_LOCAL_FTS_DEFAULT_DB = "~/workflow/ov-hybrid/index/memories.db"
+_LOCAL_FTS_SHORT_DOC_CHARS = 800  # 短于此长度的文档片段即整篇，无需替换 dense 内容
+_RRF_K = 60.0
+_RRF_DENSE_WEIGHT = 0.6
+
+
+def _load_local_fts_class():
+    """懒加载同级 local_fts.py（插件可能以包或单文件方式加载）。失败返回 None。"""
+    try:
+        from .local_fts import LocalFTSEngine  # type: ignore[import-not-found]
+
+        return LocalFTSEngine
+    except Exception:  # noqa: BLE001 - 干净安装时这个文件不存在
+        pass
+    try:
+        import importlib.util
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_fts.py")
+        if not os.path.exists(path):
+            return None
+        spec = importlib.util.spec_from_file_location("_ov_local_fts", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, "LocalFTSEngine", None)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ov-hybrid: local_fts unavailable: %s", exc)
+        return None
+
+
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _OPENVIKING_SERVICE_ENDPOINT = "https://api.vikingdb.cn-beijing.volces.com/openviking"
 _DEFAULT_AGENT = ""
@@ -163,10 +200,20 @@ _CONFIG_SCHEMA = [
     _cfg_field("recall_full_read_limit", "Max full L2 content reads per recall", type="integer", minimum=0, maximum=100, default=2),
     _cfg_field("recall_prefer_abstract", "Use abstracts instead of full L2 reads", type="boolean", default=False),
     _cfg_field("recall_resources", "Include resources in recall", type="boolean", default=False),
+    # ov-hybrid:fts-merge — 本地 FTS5/BM25 通道（与 dense 做 RRF 融合）
+    _cfg_field("local_fts_enabled", "Fuse a local SQLite FTS5/BM25 channel into automatic recall",
+               type="boolean", default=False),
+    _cfg_field("local_fts_limit", "Max local-lexical candidates entering the RRF fusion",
+               type="integer", minimum=1, maximum=50, default=8),
+    _cfg_field("local_fts_weight", "RRF weight of the local-lexical channel (dense is fixed at 0.6)",
+               type="number", minimum=0.0, maximum=1.0, step=0.05, default=0.4),
+    _cfg_field("local_fts_snippet_chars", "Characters kept on each side of a match when injecting a snippet",
+               type="integer", minimum=50, maximum=2000, default=200),
 ]
 # Typed settings (config.yaml primary, env override) keyed by config key.
 _SETTING_SPECS = {f["key"]: f for f in _CONFIG_SCHEMA if "type" in f}
 _RECALL_SETTING_KEYS = tuple(k for k in _SETTING_SPECS if k.startswith("recall_"))
+_LOCAL_FTS_SETTING_KEYS = tuple(k for k in _SETTING_SPECS if k.startswith("local_fts_"))
 # Explicit-uid URIs (viking://user/<uid>/...) work under every auth mode and
 # supported OpenViking version. The `~` alias requires OpenViking 0.4.16+ for
 # USER/ADMIN roles and 0.4.17+ for ROOT, so internal paths remain explicit.
@@ -2381,7 +2428,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if not isinstance(result, dict):
                 return ""
             candidates = [item for ctx_type in ("memories", "resources") for item in (result.get(ctx_type, []) or []) if isinstance(item, dict)]
-            selected = self._select_recall_candidates(candidates, query_text, limit=cfg["limit"], score_threshold=cfg["score_threshold"])
+            # ov-hybrid:fts-merge — dense 侧先放宽取候选，截断交给 RRF 融合。
+            hybrid = self._hybrid_config()
+            dense_limit = max(cfg["limit"] * 4, 20) if hybrid.get("enabled") else cfg["limit"]
+            selected = self._select_recall_candidates(candidates, query_text, limit=dense_limit, score_threshold=cfg["score_threshold"])
+            if hybrid.get("enabled"):
+                selected = self._fuse_local_fts(query_text, selected, limit=cfg["limit"], settings=hybrid)
             return "\n".join(self._build_prefetch_entries(
                 client, selected, prefer_abstract=cfg["prefer_abstract"], max_injected_chars=cfg["max_injected_chars"],
                 deadline=deadline, request_timeout=cfg["request_timeout_seconds"], full_read_limit=cfg["full_read_limit"],
@@ -2686,6 +2738,99 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return str(item.get("uri") or "").strip()
+
+    # -- ov-hybrid:fts-merge 本地全文通道 ------------------------------------
+
+    def _hybrid_config(self) -> Dict[str, Any]:
+        """本地全文通道配置。db 路径不走 schema（string 类型只认 off/server/auto 白名单），
+        优先级：环境变量 OPENVIKING_LOCAL_FTS_DB > memory.openviking.local_fts_db_path > 默认。"""
+        cfg, env = self._profile_config_and_env()
+        resolved = {
+            key.removeprefix("local_fts_"): self._setting(key, cfg, env=env) for key in _LOCAL_FTS_SETTING_KEYS
+        }
+        raw_env = get_secret("OPENVIKING_LOCAL_FTS_DB") if env is None else env.get("OPENVIKING_LOCAL_FTS_DB")
+        raw_cfg = (cfg or {}).get("local_fts_db_path")
+        raw = str(raw_env or raw_cfg or _LOCAL_FTS_DEFAULT_DB).strip() or _LOCAL_FTS_DEFAULT_DB
+        resolved["db_path"] = os.path.expanduser(raw)
+        return resolved
+
+    @staticmethod
+    def _local_fts_engine(settings: Dict[str, Any]):
+        """按 (db_path, snippet_chars) 缓存引擎；构造只做字符串处理，不做 I/O。"""
+        db_path = str(settings.get("db_path") or "").strip()
+        if not db_path:
+            return None
+        snippet_chars = int(settings.get("snippet_chars") or 200)
+        key = f"{db_path}|{snippet_chars}"
+        with _LOCAL_FTS_LOCK:
+            engine = _LOCAL_FTS_ENGINES.get(key)
+            if engine is not None:
+                return engine
+            engine_cls = _load_local_fts_class()
+            if engine_cls is None:
+                return None
+            try:
+                engine = engine_cls(db_path, snippet_chars=snippet_chars)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("ov-hybrid: local FTS engine init failed: %s", e)
+                return None
+            _LOCAL_FTS_ENGINES.clear()  # 只保留当前配置这一个
+            _LOCAL_FTS_ENGINES[key] = engine
+            return engine
+
+    def _fuse_local_fts(self, query: str, dense_ranked: List[Dict[str, Any]], *, limit: int,
+                        settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """RRF 加权融合：0.6/(60+rank_dense) + w/(60+rank_fts)。
+
+        只按名次融合，不比较两侧分数——dense 的分数区间只有 ±0.01，FTS 的 bm25()
+        是另一套量纲，两者放到同一个刻度上比没有意义。FTS 独有条目用「标题 + 片段」
+        顶上 abstract，因此不会触发 L2 全读，也不会占满注入预算。任何异常退回纯 dense。
+        """
+        engine = self._local_fts_engine(settings)
+        if engine is None:
+            return dense_ranked
+        try:
+            engine.refresh_if_stale()
+            hits = engine.search(query, limit=int(settings.get("limit") or 8))
+        except Exception as e:  # noqa: BLE001 - 索引坏了也不能拖垮召回
+            logger.debug("ov-hybrid: local FTS search failed: %s", e)
+            return dense_ranked
+        if not hits:
+            return dense_ranked
+
+        weight = float(settings.get("weight") or 0.0)
+        fused: Dict[str, Dict[str, Any]] = {}
+        for rank, item in enumerate(dense_ranked, 1):
+            uri = str(item.get("uri") or "").strip()
+            if not uri or uri in fused:
+                continue
+            entry = dict(item)
+            entry["_rrf"] = _RRF_DENSE_WEIGHT / (_RRF_K + rank)
+            fused[uri] = entry
+        for rank, hit in enumerate(hits, 1):
+            uri = str(hit.get("uri") or "").strip()
+            if not uri:
+                continue
+            contribution = weight / (_RRF_K + rank)
+            entry = fused.get(uri)
+            if entry is None:
+                entry = {"uri": uri, "score": 0.0, "level": 0, "category": "memory",
+                         "_rrf": 0.0, "_local_fts_only": True}
+                fused[uri] = entry
+            entry["_rrf"] = float(entry.get("_rrf") or 0.0) + contribution
+            # 长文档（或只在 FTS 侧命中的条目）用片段替换正文：snippet 已按预算生成，
+            # 这里不再二次截断，否则会把命中点截掉。
+            if entry.get("_local_fts_only") or int(hit.get("nchars") or 0) >= _LOCAL_FTS_SHORT_DOC_CHARS:
+                text = "\n".join(
+                    part for part in (str(hit.get("title") or "").strip(), str(hit.get("snippet") or "").strip())
+                    if part
+                )
+                if text:
+                    entry["abstract"] = text
+                    entry["level"] = 0
+                    entry["_local_fts_snippet"] = True
+        ranked = sorted(fused.values(), key=lambda item: float(item.get("_rrf") or 0.0), reverse=True)
+        return ranked[:limit]
 
     @classmethod
     def _select_recall_candidates(cls, items: List[Dict[str, Any]], query: str, *, limit: int, score_threshold: float) -> List[Dict[str, Any]]:
